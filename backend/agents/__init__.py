@@ -8,6 +8,13 @@ from .gpt_agent import GPTAgent
 from .deepseek_agent import DeepSeekAgent
 from .qwen_agent import QwenAgent
 from .openrouter_agent import OpenRouterAgent
+from .resilient_agent import (
+    ResilientAgent, 
+    RuleBasedFallback, 
+    ResponseValidator, 
+    ResponseCache,
+    AgentResponse
+)
 
 # Optional imports - only if dependencies are installed
 try:
@@ -33,5 +40,11 @@ __all__ = [
     "DeepSeekAgent",
     "QwenAgent",
     "OpenRouterAgent",
-    "ClaudeAgent"
+    "ClaudeAgent",
+    # Resilient Agent
+    "ResilientAgent",
+    "RuleBasedFallback",
+    "ResponseValidator",
+    "ResponseCache",
+    "AgentResponse"
 ]

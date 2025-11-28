@@ -318,6 +318,27 @@ class PaperExchange:
         
         return closed_record
     
+    def update_trailing_stop(self, symbol: str, current_price: float, atr: float) -> bool:
+        """
+        Update trailing stop for a position.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTC/USDT")
+            current_price: Current market price
+            atr: Current ATR value
+            
+        Returns:
+            True if trailing stop was updated
+        """
+        if symbol not in self.positions:
+            return False
+        
+        position = self.positions[symbol]
+        if not position.trailing_stop:
+            return False
+        
+        return position.update_trailing_stop(current_price, atr)
+    
     def check_stops(self, current_prices: Dict[str, float], atrs: Dict[str, float] = None) -> List[Dict[str, Any]]:
         """
         Check all positions for stop-loss, take-profit, and time stops.
