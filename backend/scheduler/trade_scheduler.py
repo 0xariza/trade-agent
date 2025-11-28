@@ -13,8 +13,10 @@ from backend.risk.risk_manager import RiskManager, DrawdownManager
 from backend.agents.reflection import TradeReflector
 from backend.notifications.telegram_notifier import TelegramNotifier
 from backend.database.state_manager import state_manager
+from backend.trading.spot_signal_handler import SpotSignalHandler, SpotAction
+from backend.utils.production_logger import get_logger, get_trade_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class TradingScheduler:
@@ -106,6 +108,19 @@ class TradingScheduler:
             reflection_after_n_losses=3
         )
         print(f"🔍 Trade Reflector initialized. Self-learning enabled.")
+        
+        # Initialize spot signal handler
+        self.spot_handler = SpotSignalHandler(
+            min_adx_for_buy=12.0,
+            max_rsi_for_buy=72.0,
+            require_btc_safety=True,
+            min_rsi_for_sell=25.0
+        )
+        print(f"💱 Spot Trading Handler initialized. BUY + SELL enabled.")
+        
+        # Initialize trade logger for production logging + Telegram
+        self.trade_logger = get_trade_logger()
+        logger.info("Trade logger initialized with Telegram notifications")
 
     def start(self):
         """
@@ -336,19 +351,14 @@ class TradingScheduler:
                 print(f"   Exit: ${closed_pos['exit_price']:,.2f} | P&L: ${closed_pos['pnl']:,.2f} ({closed_pos['pnl_pct']:+.2f}%)")
                 print(f"   Reason: {reason}")
                 
-                # Record to memory
-                self.memory.add_trade(
-                    symbol=closed_pos['symbol'],
-                    side=closed_pos['side'],
-                    entry_price=closed_pos['entry_price'],
-                    exit_price=closed_pos['exit_price'],
-                    pnl=closed_pos['pnl'],
-                    pnl_pct=closed_pos['pnl_pct'],
-                    exit_reason=closed_pos['exit_reason']
-                )
+                # Record to memory (use add_trade_from_dict for dict input)
+                self.memory.add_trade_from_dict(closed_pos)
                 
                 # Record outcome for drawdown manager
-                self.drawdown_manager.record_trade_outcome(closed_pos['pnl'] >= 0)
+                self.drawdown_manager.record_trade(
+                    pnl=closed_pos['pnl'],
+                    pnl_pct=closed_pos['pnl_pct']
+                )
                 
                 # Analyze trade with reflector
                 self.reflector.analyze_trade({
@@ -449,8 +459,17 @@ class TradingScheduler:
             print(f"  ANALYSIS CYCLE #{self.cycle_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"{'='*60}")
             
-            for symbol in self.symbols:
-                await self._process_symbol(symbol)
+            # Process symbols with controlled concurrency
+            # Process 3 at a time to avoid rate limits while being faster than sequential
+            batch_size = 3
+            for i in range(0, len(self.symbols), batch_size):
+                batch = self.symbols[i:i + batch_size]
+                tasks = [self._process_symbol_safe(symbol) for symbol in batch]
+                await asyncio.gather(*tasks)
+                
+                # Small delay between batches to avoid rate limits
+                if i + batch_size < len(self.symbols):
+                    await asyncio.sleep(1)
             
             # 4. Print Portfolio Summary
             await self._print_portfolio_summary()
@@ -526,27 +545,40 @@ class TradingScheduler:
         
         # Send notifications and record to memory
         for closed_pos in closed:
-            emoji = "🛑" if closed_pos['exit_reason'] == 'stop_loss' else "🎯" if closed_pos['exit_reason'] == 'take_profit' else "⏰"
-            
             # Record to agent memory
             self.memory.add_trade_from_dict(closed_pos)
             
-            await self.telegram_notifier.send_message(
-                f"{emoji} *POSITION CLOSED*\n\n"
-                f"*Symbol:* {closed_pos['symbol']}\n"
-                f"*Reason:* {closed_pos['exit_reason'].upper()}\n"
-                f"*Entry:* ${closed_pos['entry_price']:,.2f}\n"
-                f"*Exit:* ${closed_pos['exit_price']:,.2f}\n"
-                f"*P&L:* ${closed_pos['pnl']:,.2f} ({closed_pos['pnl_pct']:+.2f}%)\n"
-                f"*Hold Time:* {closed_pos['hold_duration_hours']:.1f} hours"
-            )
-            
-            self.daily_trades_count += 1
-            
-            # Add lesson if it was a stop-loss
+            # Log with production logger + Telegram based on exit reason
             if closed_pos['exit_reason'] == 'stop_loss':
+                await self.trade_logger.log_stop_loss(
+                    symbol=closed_pos['symbol'],
+                    entry_price=closed_pos['entry_price'],
+                    exit_price=closed_pos['exit_price'],
+                    pnl=closed_pos['pnl'],
+                    pnl_pct=closed_pos['pnl_pct']
+                )
                 lesson = f"Stop-loss hit on {closed_pos['symbol']}. Entry: ${closed_pos['entry_price']:,.0f}, Loss: {closed_pos['pnl_pct']:.1f}%"
                 self.memory.add_lesson(lesson)
+            elif closed_pos['exit_reason'] == 'take_profit':
+                await self.trade_logger.log_take_profit(
+                    symbol=closed_pos['symbol'],
+                    entry_price=closed_pos['entry_price'],
+                    exit_price=closed_pos['exit_price'],
+                    pnl=closed_pos['pnl'],
+                    pnl_pct=closed_pos['pnl_pct']
+                )
+            else:
+                # Other exits (trailing stop, max hold, etc.)
+                await self.trade_logger.log_sell(
+                    symbol=closed_pos['symbol'],
+                    amount=closed_pos.get('amount', 0),
+                    price=closed_pos['exit_price'],
+                    pnl=closed_pos['pnl'],
+                    pnl_pct=closed_pos['pnl_pct'],
+                    reason=closed_pos['exit_reason'].replace('_', ' ').title()
+                )
+            
+            self.daily_trades_count += 1
             
             # Record trade to drawdown manager
             self.drawdown_manager.record_trade(
@@ -579,6 +611,14 @@ class TradingScheduler:
                 pnl_pct=closed_pos['pnl_pct']
             )
 
+    async def _process_symbol_safe(self, symbol: str):
+        """Wrapper that catches errors to prevent one symbol from crashing the batch."""
+        try:
+            await self._process_symbol(symbol)
+        except Exception as e:
+            logger.error(f"Error processing {symbol}: {e}")
+            print(f"  ❌ Error processing {symbol}: {str(e)[:50]}")
+    
     async def _process_symbol(self, symbol: str):
         """Process a single symbol for trading signals."""
         print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Processing {symbol}")
@@ -678,108 +718,40 @@ class TradingScheduler:
         atr: float,
         market_snapshot: Dict[str, Any]
     ):
-        """Handle trading signal from agent with strict pre-trade filters."""
-        signal_type = decision.get("signal_type", "HOLD").upper()
-        trend = decision.get("trend", "neutral").lower()
-        confidence = decision.get("confidence", "low").lower()
+        """
+        Handle trading signal using SpotSignalHandler.
+        
+        SPOT TRADING:
+        - BUY: Purchase asset with USDT (open position)
+        - SELL: Sell asset back to USDT (close position)
+        """
         reasoning = decision.get("reasoning", "No reasoning provided")
         market_regime = decision.get("market_regime", "unknown")
         
         # Check if we already have a position
-        existing_position = self.paper_exchange.get_position(symbol)
+        has_position = self.paper_exchange.has_position(symbol)
         
-        # =====================================================
-        # PRE-TRADE FILTERS (Must pass ALL to open position)
-        # =====================================================
+        # Use SpotSignalHandler for clean BUY/SELL logic
+        signal_decision = self.spot_handler.process_signal(
+            agent_decision=decision,
+            market_data=market_snapshot,
+            has_position=has_position,
+            symbol=symbol
+        )
         
-        # Extract indicator data
-        tf_1h = market_snapshot.get('timeframes', {}).get('1h', {})
-        tf_4h = market_snapshot.get('timeframes', {}).get('4h', {})
-        tf_1h_ind = tf_1h.get('indicators', {})
-        tf_4h_ind = tf_4h.get('indicators', {})
+        # Get emoji and log
+        emoji = self.spot_handler.get_action_emoji(signal_decision.action)
+        print(f"  {emoji} Action: {signal_decision.action.value.upper()} (Signal: {signal_decision.signal_type})")
         
-        adx_1h = tf_1h_ind.get('adx', 0)
-        adx_4h = tf_4h_ind.get('adx', 0)
-        rsi_1h = tf_1h_ind.get('rsi', 50)
-        rsi_4h = tf_4h_ind.get('rsi', 50)
-        macd_1h = tf_1h_ind.get('macd', 'neutral')
-        macd_4h = tf_4h_ind.get('macd', 'neutral')
-        
-        # BTC trend check for alts
-        btc_trend = market_snapshot.get('btc_trend', {})
-        btc_safe = btc_trend.get('is_safe_for_alts', True) if btc_trend else True
-        
-        filters_passed = True
-        block_reason = None
-        
-        # FILTER 1: BTC Safety for Alts
-        if symbol != "BTC/USDT" and not btc_safe:
-            filters_passed = False
-            block_reason = f"🚫 BTC is {btc_trend.get('trend', 'bearish')} - Not safe for alts"
-        
-        # FILTER 2: ADX Trend Strength (must have SOME trend)
-        elif adx_4h < 15 and adx_1h < 15:
-            filters_passed = False
-            block_reason = f"🚫 No trend detected (ADX 1H={adx_1h:.0f}, 4H={adx_4h:.0f} < 15)"
-        
-        # FILTER 3: Timeframe Alignment for BUY signals
-        elif "BUY" in signal_type:
-            # For BUY: 1H and 4H should not conflict
-            if macd_1h == 'bearish' and macd_4h == 'bearish':
-                filters_passed = False
-                block_reason = "🚫 Both 1H and 4H MACD bearish - no buy"
-            
-            # Don't buy into overbought on both timeframes
-            if rsi_1h > 70 and rsi_4h > 65:
-                filters_passed = False
-                block_reason = f"🚫 Overbought (RSI 1H={rsi_1h:.0f}, 4H={rsi_4h:.0f})"
-        
-        # FILTER 4: Confidence Check
-        elif confidence == "low" and "STRONG" not in signal_type:
-            filters_passed = False
-            block_reason = "🚫 Low confidence signal rejected"
-        
-        # FILTER 5: Only accept STRONG or MODERATE buy signals
-        elif "BUY" in signal_type and "WEAK" in signal_type:
-            # Weak buys need stricter criteria
-            if adx_4h < 20:  # Need at least some trend for weak buys
-                filters_passed = False
-                block_reason = f"🚫 Weak buy needs ADX > 20 (current: {adx_4h:.0f})"
+        if signal_decision.blocked_reason:
+            print(f"  🚫 Blocked: {signal_decision.blocked_reason}")
         
         # Determine action
-        action = "hold"
-        multiplier = 1.0
+        multiplier = signal_decision.position_multiplier
         
-        if not filters_passed:
-            print(f"  {block_reason}")
-            action = "hold"
-        elif "BUY" in signal_type and trend == "bullish":
-            # Must be BULLISH trend + BUY signal (not just one or the other)
-            if not existing_position:
-                action = "open_long"
-                if "STRONG" in signal_type and confidence == "high":
-                    multiplier = 1.0
-                elif "STRONG" in signal_type or (confidence == "high"):
-                    multiplier = 0.8
-                elif "MODERATE" in signal_type:
-                    multiplier = 0.6
-                elif "OVERSOLD" in signal_type:
-                    multiplier = 0.5  # Oversold reversals are risky
-                else:
-                    multiplier = 0.4  # Weak signals get small size
-            else:
-                print(f"  Signal: BUY (Ignored - Already in position)")
-        
-        elif "SELL" in signal_type or trend == "bearish":
-            if existing_position:
-                action = "close_position"
-            else:
-                print(f"  Signal: SELL (Ignored - No position)")
-        
-        print(f"  Action: {action.upper()} (Signal: {signal_type})")
-        
-        # Execute action
-        if action == "open_long":
+        # Execute action based on SpotAction
+        if signal_decision.action == SpotAction.BUY:
+            print(f"  🟢 Executing SPOT BUY for {symbol}")
             await self._open_position(
                 symbol=symbol,
                 side="long",
@@ -791,8 +763,9 @@ class TradingScheduler:
                 market_snapshot=market_snapshot
             )
         
-        elif action == "close_position":
-            result = self.paper_exchange.close_position(symbol, current_price, "signal")
+        elif signal_decision.action == SpotAction.SELL:
+            print(f"  🔴 Executing SPOT SELL for {symbol}")
+            result = self.paper_exchange.close_position(symbol, current_price, "signal_sell")
             if result:
                 # Record to memory
                 self.memory.add_trade_from_dict(result)
@@ -814,12 +787,15 @@ class TradingScheduler:
                 )
                 
                 self.daily_trades_count += 1
-                await self.telegram_notifier.send_trade_alert(
+                
+                # Log SELL with production logger + Telegram
+                await self.trade_logger.log_sell(
                     symbol=symbol,
-                    side="sell",
                     amount=result['amount'],
                     price=result['exit_price'],
-                    reasoning=f"Signal close. P&L: ${result['pnl']:,.2f} ({result['pnl_pct']:+.2f}%)"
+                    pnl=result['pnl'],
+                    pnl_pct=result['pnl_pct'],
+                    reason="Agent SELL signal"
                 )
 
     async def _open_position(
@@ -904,6 +880,31 @@ class TradingScheduler:
             print(f"  ❌ Risk check failed")
             return
         
+        # Check correlation limits (if manager attached)
+        if hasattr(self, 'corr_manager') and self.corr_manager:
+            trade_value = trade_amount * current_price
+            current_positions = {
+                s: p.to_dict() for s, p in self.paper_exchange.get_all_positions().items()
+            }
+            
+            can_open, corr_reason = self.corr_manager.can_open_position(
+                symbol=symbol,
+                position_size_usd=trade_value,
+                current_positions=current_positions,
+                portfolio_value=portfolio_value
+            )
+            
+            if not can_open:
+                print(f"  🚫 Correlation block: {corr_reason}")
+                return
+            
+            # Apply correlation-based size reduction
+            size_mult = self.corr_manager.get_position_size_multiplier(symbol, current_positions)
+            if size_mult < 1.0:
+                old_amount = trade_amount
+                trade_amount *= size_mult
+                print(f"  ⚠️ Reduced size due to correlation: {old_amount:.6f} → {trade_amount:.6f}")
+        
         # Open position
         position = self.paper_exchange.open_position(
             symbol=symbol,
@@ -921,12 +922,15 @@ class TradingScheduler:
         
         if position:
             self.daily_trades_count += 1
-            await self.telegram_notifier.send_trade_alert(
+            
+            # Log BUY with production logger + Telegram
+            await self.trade_logger.log_buy(
                 symbol=symbol,
-                side="buy",
                 amount=trade_amount,
                 price=current_price,
-                reasoning=f"{reasoning}\n\nSL: ${stop_levels.stop_loss:,.2f} | TP: ${stop_levels.take_profit:,.2f}"
+                reason=reasoning[:100],
+                stop_loss=stop_levels.stop_loss,
+                take_profit=stop_levels.take_profit
             )
             
             # Save to DB

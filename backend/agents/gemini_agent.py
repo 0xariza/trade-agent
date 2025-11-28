@@ -1,10 +1,40 @@
 import os
 import json
 import logging
+import asyncio
 from typing import Dict, Any
+from datetime import datetime, timedelta
 import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
+
+# Simple rate limiting for Gemini API
+class GeminiRateLimiter:
+    """Simple rate limiter for Gemini API calls."""
+    
+    def __init__(self, calls_per_minute: int = 30):
+        self.calls_per_minute = calls_per_minute
+        self.call_times = []
+    
+    async def wait_if_needed(self):
+        """Wait if we're hitting rate limits."""
+        now = datetime.now()
+        minute_ago = now - timedelta(minutes=1)
+        
+        # Remove old calls
+        self.call_times = [t for t in self.call_times if t > minute_ago]
+        
+        if len(self.call_times) >= self.calls_per_minute:
+            # Wait until oldest call is > 1 minute ago
+            wait_time = (self.call_times[0] - minute_ago).total_seconds() + 1
+            if wait_time > 0:
+                logger.info(f"Rate limit: waiting {wait_time:.1f}s")
+                await asyncio.sleep(wait_time)
+        
+        self.call_times.append(now)
+
+# Global rate limiter for Gemini
+_gemini_rate_limiter = GeminiRateLimiter(calls_per_minute=30)
 
 class GeminiAgent:
     """
@@ -31,71 +61,112 @@ class GeminiAgent:
         Analyze market data and return trading decision.
         """
         system_prompt = """
-        You are a CONSERVATIVE crypto trading agent. Your goal is to AVOID LOSSES, not chase gains.
+        You are a crypto SPOT trading agent. You can BUY or SELL assets.
         
-        ### CRITICAL RULES (NEVER BREAK THESE)
+        ### SPOT TRADING RULES
         
-        1. **NO TREND = NO TRADE**: If ADX < 20 on BOTH 1h and 4h → HOLD. Period.
-        2. **TIMEFRAME ALIGNMENT REQUIRED**: For BUY signals, at least 2/3 timeframes must be bullish.
-        3. **CONFLICTING SIGNALS = HOLD**: If 1h says SELL and 4h says BUY → HOLD.
-        4. **OVERBOUGHT = NO BUY**: If RSI > 65 on 4h, do NOT issue any BUY signal.
-        5. **MACD MATTERS**: Both 1h and 4h MACD must NOT be bearish to issue BUY.
+        **BUY** = Purchase the asset with USDT (go long)
+        **SELL** = Sell the asset back to USDT (exit position)
         
-        ---
-        
-        ### DECISION PROCESS (Follow in order)
-        
-        **Step 1: Check ADX (Trend Strength)**
-        - ADX 4h > 25: Strong trend - can trade
-        - ADX 4h 15-25: Weak trend - reduce confidence
-        - ADX 4h < 15: NO TREND - issue HOLD
-        
-        **Step 2: Check Timeframe Alignment**
-        For BUY: Count bullish signals (MACD bullish, RSI < 60, EMA 9 > 21)
-        - 3/3 bullish: High confidence
-        - 2/3 bullish: Moderate confidence  
-        - 1/3 or 0/3 bullish: HOLD
-        
-        **Step 3: Apply Strict Entry Rules**
-        - STRONG_BUY: ADX > 25, ALL timeframes bullish, RSI < 50
-        - MODERATE_BUY: ADX > 20, 2/3 timeframes bullish, RSI < 60
-        - HOLD: Everything else (when in doubt, stay out!)
-        - SELL: Only if we have an open position AND trend reversed
+        This is NOT futures trading. No shorting. No leverage.
         
         ---
         
-        ### RESPONSE FORMAT
-        Respond ONLY in valid JSON:
+        ### WHEN TO BUY (All conditions should align)
+        
+        1. **Trend is BULLISH**: EMA 9 > EMA 21, MACD bullish
+        2. **Trend is STRONG**: ADX > 20 on 4H timeframe
+        3. **Not overbought**: RSI < 70 on 4H
+        4. **Timeframe alignment**: At least 2/3 timeframes bullish
+        5. **BTC safe** (for altcoins): BTC not in downtrend
+        
+        BUY Signal Types:
+        - STRONG_BUY: All conditions met, high confidence
+        - MODERATE_BUY: Most conditions met, moderate confidence
+        - WEAK_BUY: Some bullish signs but not ideal (smaller position)
+        
+        ---
+        
+        ### WHEN TO SELL (Exit existing position)
+        
+        1. **Trend REVERSAL**: MACD turns bearish on multiple timeframes
+        2. **Overbought exhaustion**: RSI > 75 and starting to turn down
+        3. **Breakdown**: Price breaks below key EMA (21 or 50)
+        4. **Bearish divergence**: Price makes high but RSI makes lower high
+        5. **BTC dump**: BTC dropping hard (for altcoins)
+        
+        SELL Signal Types:
+        - STRONG_SELL: Clear reversal, exit immediately
+        - SELL: Trend weakening, should exit
+        
+        ---
+        
+        ### WHEN TO HOLD
+        
+        - No clear trend (ADX < 15)
+        - Mixed signals between timeframes
+        - Already in position and trend still valid
+        - No position and no buy signal
+        
+        ---
+        
+        ### RESPONSE FORMAT (JSON only)
+        
         {
             "market_regime": "trending" | "ranging" | "volatile",
-            "adx_check": {"1h": <float>, "4h": <float>, "passed": true/false},
-            "alignment_check": {"bullish_count": 0-3, "passed": true/false},
-            "signal_type": "STRONG_BUY" | "MODERATE_BUY" | "HOLD" | "SELL",
+            "signal_type": "STRONG_BUY" | "MODERATE_BUY" | "WEAK_BUY" | "HOLD" | "SELL" | "STRONG_SELL",
             "trend": "bullish" | "bearish" | "neutral",
             "confidence": "high" | "moderate" | "low",
-            "reasoning": "Why this decision? Be specific about which rules applied."
+            "reasoning": "Explain your decision based on indicators"
         }
         
-        IMPORTANT: When uncertain, ALWAYS choose HOLD. Protecting capital is priority #1.
+        Be decisive. If bullish, say BUY. If bearish, say SELL. Only HOLD when truly uncertain.
         """
         
-        user_prompt = f"""
-        Analyze this market data:
+        # Check if we have an open position
+        open_positions = market_data.get('open_positions', {})
+        symbol = market_data.get('symbol', 'BTC/USDT')
+        has_position = symbol in open_positions
+        position_info = ""
         
-        Symbol: {market_data.get('symbol', 'BTC/USDT')}
+        if has_position:
+            pos = open_positions[symbol]
+            entry_price = pos.get('entry_price', 0)
+            current_price = market_data.get('price', 0)
+            if entry_price > 0:
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                position_info = f"""
+        
+        ⚠️ YOU HAVE AN OPEN POSITION:
+        - Entry Price: ${entry_price:,.2f}
+        - Current Price: ${current_price:,.2f}
+        - Unrealized P&L: {pnl_pct:+.2f}%
+        - Consider SELL if trend is reversing!
+        """
+        else:
+            position_info = "\n        📍 NO OPEN POSITION - Looking for BUY opportunity"
+        
+        user_prompt = f"""
+        Analyze this market data for SPOT TRADING:
+        
+        Symbol: {symbol}
         Current Price: ${market_data.get('price', 0):,.2f}
         24h Change: {market_data.get('change_24h', 0):.2f}%
-        Volume: ${market_data.get('volume', 0):,.0f}
+        {position_info}
         
         Multi-Timeframe Analysis:
         {json.dumps(market_data.get('timeframes', {}), indent=2)}
         
+        BTC Trend: {market_data.get('btc_trend', {}).get('trend', 'unknown')}
         News Sentiment: {market_data.get('news_sentiment', {}).get('sentiment_label', 'neutral')} ({market_data.get('news_sentiment', {}).get('sentiment_score', 0):+.2f})
         
-        Provide your analysis in JSON format.
+        Should we BUY, SELL, or HOLD? Respond in JSON format.
         """
         
         try:
+            # Apply rate limiting
+            await _gemini_rate_limiter.wait_if_needed()
+            
             # Configure safety settings to avoid blocking legitimate trading analysis
             safety_settings = [
                 {
