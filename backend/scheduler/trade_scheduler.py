@@ -160,16 +160,8 @@ class TradingScheduler:
         
         self.scheduler.start()
         logger.info("Trading scheduler started")
-    
-    def stop(self):
-        """Stop the trading scheduler gracefully."""
-        try:
-            if hasattr(self, 'scheduler') and self.scheduler.running:
-                self.scheduler.shutdown(wait=False)
-                logger.info("Trading scheduler stopped")
-        except Exception as e:
-            logger.error(f"Error stopping scheduler: {e}")
         
+        # Print startup banner
         print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
 ║  TRADING SCHEDULER STARTED                                       ║
@@ -188,6 +180,15 @@ class TradingScheduler:
                 balance=self.paper_exchange.get_balance("USDT")
             )
         )
+    
+    def stop(self):
+        """Stop the trading scheduler gracefully."""
+        try:
+            if hasattr(self, 'scheduler') and self.scheduler.running:
+                self.scheduler.shutdown(wait=False)
+                logger.info("Trading scheduler stopped")
+        except Exception as e:
+            logger.error(f"Error stopping scheduler: {e}")
     
     async def restore_state(self) -> bool:
         """Restore state from database on startup."""
@@ -719,7 +720,6 @@ class TradingScheduler:
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
             print(f"  ❌ Error processing {symbol}: {str(e)[:50]}")
-
     async def _process_symbol(self, symbol: str):
         """Process a single symbol for trading signals."""
         print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Processing {symbol}")

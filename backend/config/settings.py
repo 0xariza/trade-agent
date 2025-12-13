@@ -53,12 +53,6 @@ class Settings(BaseSettings):
     telegram_bot_token: str = Field(default="", env="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", env="TELEGRAM_CHAT_ID")
     
-    # Database
-    database_url: str = Field(
-        default="sqlite:///./alpha_arena.db",
-        env="DATABASE_URL"
-    )
-    
     # =========================
     # TRADING MODE
     # =========================
@@ -110,11 +104,11 @@ class Settings(BaseSettings):
     # PostgreSQL is the default (recommended for production)
     # Format: postgresql+asyncpg://user:password@host:port/database
     # Example: postgresql+asyncpg://alpha_user:alpha_password@localhost:5432/alpha_arena
-    # 
-    # For SQLite (fallback, no setup required):
-    # sqlite+aiosqlite:///./alpha_arena.db
+    # Database URL
+    # Default: SQLite (works out of the box, no setup required)
+    # For PostgreSQL: postgresql+asyncpg://user:password@localhost:5432/dbname
     database_url: str = Field(
-        default="postgresql+asyncpg://alpha_user:alpha_password@localhost:5432/alpha_arena",
+        default="sqlite+aiosqlite:///./alpha_arena.db",
         env="DATABASE_URL"
     )
     
