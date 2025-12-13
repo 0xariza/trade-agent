@@ -5,6 +5,7 @@
 # ==================== SECRETS ====================
 # CRITICAL: Never commit these!
 .env
+.env.bak
 .env.local
 .env.*.local
 .env.production
