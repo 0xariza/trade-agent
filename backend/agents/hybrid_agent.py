@@ -168,11 +168,15 @@ IMPORTANT:
 """
         
         try:
+            # Get token limit from settings
+            from backend.config import settings
+            max_tokens = settings.llm_max_output_tokens
+            
             response = self.llm_model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0.3,  # Lower temp for more consistent decisions
-                    max_output_tokens=500,
+                    max_output_tokens=max_tokens,
                 )
             )
             

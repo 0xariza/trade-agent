@@ -1,0 +1,135 @@
+{
+  "dashboard": {
+    "title": "Alpha Arena - Trading Overview",
+    "tags": ["trading", "alpha-arena"],
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "30s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Portfolio Value",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "alpha_arena_portfolio_value_usd",
+            "legendFormat": "Portfolio Value",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "currencyUSD", "label": "USD"},
+          {"format": "short", "label": null}
+        ],
+        "xaxis": {"mode": "time"},
+        "legend": {"show": true}
+      },
+      {
+        "id": 2,
+        "title": "Win Rate",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "alpha_arena_win_rate_percent",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 50, "color": "yellow"},
+                {"value": 60, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "title": "Current Drawdown",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+        "targets": [
+          {
+            "expr": "alpha_arena_drawdown_percent",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 5, "color": "yellow"},
+                {"value": 10, "color": "red"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "Open Positions",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "alpha_arena_open_positions",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "title": "Daily P&L",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "targets": [
+          {
+            "expr": "alpha_arena_daily_pnl_usd",
+            "legendFormat": "Daily P&L",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {"format": "currencyUSD", "label": "USD"},
+          {"format": "short", "label": null}
+        ],
+        "xaxis": {"mode": "time"}
+      },
+      {
+        "id": 6,
+        "title": "LLM Success Rate",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 12},
+        "targets": [
+          {
+            "expr": "rate(alpha_arena_llm_success_total[5m])",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "max": 100
+          }
+        }
+      }
+    ]
+  }
+}
+

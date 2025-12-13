@@ -111,6 +111,10 @@ Edit `.env` with your API keys:
 # Required
 GEMINI_API_KEY=your_gemini_api_key
 
+# Optional: Fallback Gemini API keys (comma-separated)
+# If primary key hits quota/rate limit, bot will automatically rotate to fallback keys
+GEMINI_FALLBACK_KEYS=AIzaSyDXhEYXxCd_Ma6iRSp-SjFeXClpgouZ7qw,AIzaSyCUAsBJT2YfrR7X12UJuCLhK7Kes9Jv6ys,AIzaSyBn8_77NlAvw556ZpSzBpyVqm04M1rpInc
+
 # Optional (for other agents)
 OPENAI_API_KEY=your_openai_key
 OPENROUTER_API_KEY=your_openrouter_key

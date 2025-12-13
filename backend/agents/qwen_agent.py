@@ -28,6 +28,14 @@ class QwenAgent(BaseTradingAgent):
         )
         
         logger.info(f"Qwen Agent initialized with model: {self.model} at {self.base_url}")
+    
+    def _get_max_tokens(self) -> int:
+        """Get max tokens from settings."""
+        try:
+            from backend.config import settings
+            return settings.llm_max_output_tokens
+        except:
+            return 4000  # Default fallback
 
     async def analyze_market(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -170,7 +178,7 @@ class QwenAgent(BaseTradingAgent):
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.7,
-                max_tokens=2000
+                max_tokens=self._get_max_tokens()
             )
             
             response_text = response.choices[0].message.content

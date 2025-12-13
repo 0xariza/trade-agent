@@ -143,10 +143,14 @@ News Sentiment: {market_data.get('news_sentiment', {}).get('sentiment_label', 'n
 Provide your analysis in JSON format following the exact structure specified."""
 
         try:
+            # Get token limit from settings
+            from backend.config import settings
+            max_tokens = settings.llm_max_output_tokens
+            
             # Make API call to Claude
             message = await self.client.messages.create(
                 model=self.model,
-                max_tokens=2000,
+                max_tokens=max_tokens,
                 temperature=0.7,
                 system=system_prompt,
                 messages=[

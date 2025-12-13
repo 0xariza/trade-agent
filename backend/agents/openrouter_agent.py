@@ -20,6 +20,14 @@ class OpenRouterAgent(BaseTradingAgent):
         )
         # Default to a cost-effective but capable model, can be overridden in config
         self.model = config.get("model", "deepseek/deepseek-chat") if config else "deepseek/deepseek-chat"
+    
+    def _get_max_tokens(self) -> int:
+        """Get max tokens from settings."""
+        try:
+            from backend.config import settings
+            return settings.llm_max_output_tokens
+        except:
+            return 4000  # Default fallback
 
     async def analyze_market(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -75,7 +83,7 @@ class OpenRouterAgent(BaseTradingAgent):
                 "X-Title": "Alpha Arena Trading Agent" # Optional
             },
             response_format={"type": "json_object"},
-            max_tokens=500,  # Reduced from 1000 to save credits
+            max_tokens=self._get_max_tokens(),
             temperature=0.7
         )
         

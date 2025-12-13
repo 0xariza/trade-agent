@@ -28,11 +28,93 @@ class MarketDataProvider:
     """
     Fetches real-time market data and calculates technical indicators.
     Enhanced with crypto-specific signals.
+    
+    Supports multiple exchanges:
+    - binance, binanceus
+    - kraken
+    - kucoin
+    - bybit
+    - okx
+    - coinbase
     """
     
-    def __init__(self, exchange_id: str = 'binance'):
-        self.exchange_id = exchange_id
-        self.exchange = getattr(ccxt, exchange_id)()
+    # Exchange-specific configurations
+    EXCHANGE_CONFIGS = {
+        'kraken': {
+            'options': {
+                'adjustForTimeDifference': True
+            },
+            'rateLimit': 1000
+        },
+        'kucoin': {
+            'options': {
+                'adjustForTimeDifference': True
+            },
+            'rateLimit': 2000
+        },
+        'binance': {
+            'options': {
+                'defaultType': 'spot'
+            },
+            'rateLimit': 1200
+        },
+        'binanceus': {
+            'options': {
+                'defaultType': 'spot'
+            },
+            'rateLimit': 1200
+        },
+        'bybit': {
+            'options': {
+                'defaultType': 'spot'
+            },
+            'rateLimit': 1000
+        },
+        'okx': {
+            'options': {
+                'defaultType': 'spot'
+            },
+            'rateLimit': 1000
+        },
+        'coinbase': {
+            'rateLimit': 1000
+        }
+    }
+    
+    def __init__(self, exchange_id: str = 'binance', api_key: str = None, api_secret: str = None, passphrase: str = None):
+        """
+        Initialize market data provider.
+        
+        Args:
+            exchange_id: Exchange name (binance, kraken, kucoin, etc.)
+            api_key: Optional API key (not needed for public data)
+            api_secret: Optional API secret (not needed for public data)
+            passphrase: Optional passphrase (required for KuCoin API)
+        """
+        self.exchange_id = exchange_id.lower()
+        
+        # Get exchange class
+        exchange_class = getattr(ccxt, self.exchange_id, None)
+        if not exchange_class:
+            raise ValueError(f"Exchange '{exchange_id}' not supported by CCXT")
+        
+        # Get exchange-specific config
+        config = self.EXCHANGE_CONFIGS.get(self.exchange_id, {}).copy()
+        
+        # Add API credentials if provided
+        if api_key and api_secret:
+            config['apiKey'] = api_key
+            config['secret'] = api_secret
+            config['enableRateLimit'] = True
+            
+            # KuCoin requires passphrase
+            if self.exchange_id == 'kucoin' and passphrase:
+                config['password'] = passphrase
+        
+        # Initialize exchange
+        self.exchange = exchange_class(config)
+        
+        logger.info(f"MarketDataProvider initialized with {self.exchange_id}")
         
         # Cache for BTC data (refreshed every 5 minutes)
         self._btc_cache: Dict[str, Any] = {}
@@ -43,15 +125,131 @@ class MarketDataProvider:
         self._fng_cache: Optional[Dict[str, Any]] = None
         self._fng_cache_time: Optional[datetime] = None
         
+        # Performance: Market data cache (TTL-based)
+        self._market_data_cache: Dict[str, Dict[str, Any]] = {}
+        self._market_data_cache_times: Dict[str, datetime] = {}
+        # Cache TTL from settings (default 60 seconds)
+        try:
+            from backend.config import settings
+            self._market_data_cache_ttl = settings.market_data_cache_ttl_seconds
+        except:
+            self._market_data_cache_ttl = 60  # Default fallback
+        
+        # Performance: OHLCV cache (reduces API calls)
+        self._ohlcv_cache: Dict[str, Dict[str, pd.DataFrame]] = {}
+        self._ohlcv_cache_times: Dict[str, datetime] = {}
+        self._ohlcv_cache_ttl = 30  # 30 second cache for OHLCV data
+    
+    @classmethod
+    async def create_with_fallback(
+        cls,
+        primary_exchange: str,
+        fallback_exchanges: List[str],
+        api_credentials: Dict[str, Dict[str, str]] = None
+    ) -> 'MarketDataProvider':
+        """
+        Create MarketDataProvider with automatic fallback.
+        Tries primary exchange first, then fallbacks if it fails.
+        
+        Args:
+            primary_exchange: Primary exchange to try
+            fallback_exchanges: List of fallback exchanges to try in order
+            api_credentials: Dict mapping exchange_id to {'api_key', 'api_secret', 'passphrase'}
+        
+        Returns:
+            MarketDataProvider instance using the first working exchange
+        
+        Raises:
+            Exception: If all exchanges fail
+        """
+        api_credentials = api_credentials or {}
+        fallback_exchanges = fallback_exchanges or []
+        all_exchanges = [primary_exchange] + fallback_exchanges
+        
+        last_error = None
+        provider = None
+        for exchange_id in all_exchanges:
+            try:
+                # Get credentials for this exchange
+                creds = api_credentials.get(exchange_id, {})
+                api_key = creds.get('api_key')
+                api_secret = creds.get('api_secret')
+                passphrase = creds.get('passphrase')
+                
+                # Create provider
+                provider = cls(
+                    exchange_id=exchange_id,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    passphrase=passphrase
+                )
+                
+                # Test connection with a simple fetch
+                test_ohlcv = await provider.get_ohlcv("BTC/USDT", limit=1)
+                if not test_ohlcv.empty:
+                    logger.info(f"✓ Successfully connected to {exchange_id}")
+                    return provider
+                else:
+                    logger.warning(f"✗ {exchange_id} returned empty data, trying next...")
+                    if provider:
+                        await provider.close()
+                    provider = None
+                    
+            except Exception as e:
+                last_error = e
+                logger.warning(f"✗ {exchange_id} failed: {str(e)[:100]}, trying next...")
+                if provider:
+                    try:
+                        await provider.close()
+                    except:
+                        pass
+                provider = None
+                continue
+        
+        # All exchanges failed
+        error_msg = f"All exchanges failed. Last error: {last_error}"
+        logger.error(error_msg)
+        raise Exception(error_msg)
+    
+    async def test_connection(self, symbol: str = "BTC/USDT") -> bool:
+        """Test if the exchange connection works."""
+        try:
+            ohlcv = await self.get_ohlcv(symbol, limit=1)
+            return not ohlcv.empty
+        except Exception as e:
+            logger.error(f"Connection test failed: {e}")
+            return False
+        
     async def close(self):
         await self.exchange.close()
 
     async def get_ohlcv(self, symbol: str, timeframe: str = '1h', limit: int = 100) -> pd.DataFrame:
-        """Fetch OHLCV data from the exchange."""
+        """Fetch OHLCV data from the exchange with caching."""
+        # Check cache first
+        cache_key = f"{symbol}:{timeframe}:{limit}"
+        now = datetime.now()
+        
+        if cache_key in self._ohlcv_cache:
+            cache_time = self._ohlcv_cache_times.get(cache_key)
+            if cache_time and (now - cache_time).total_seconds() < self._ohlcv_cache_ttl:
+                logger.debug(f"Using cached OHLCV for {cache_key}")
+                return self._ohlcv_cache[cache_key].copy()
+        
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            
+            # Cache the result
+            self._ohlcv_cache[cache_key] = df.copy()
+            self._ohlcv_cache_times[cache_key] = now
+            
+            # Clean old cache entries (keep last 100)
+            if len(self._ohlcv_cache) > 100:
+                oldest_key = min(self._ohlcv_cache_times.items(), key=lambda x: x[1])[0]
+                del self._ohlcv_cache[oldest_key]
+                del self._ohlcv_cache_times[oldest_key]
+            
             return df
         except Exception as e:
             logger.error(f"Error fetching data for {symbol}: {e}")
@@ -226,29 +424,66 @@ class MarketDataProvider:
         return {"value": 50, "classification": "Neutral", "signal": "neutral", "interpretation": "Data unavailable"}
 
     def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate all technical indicators."""
-        if df.empty:
+        """
+        Calculate all technical indicators.
+        PERFORMANCE: Uses vectorized pandas operations for speed.
+        """
+        if df.empty or len(df) < 2:
             return df
+        
+        # PERFORMANCE: Work on copy to avoid modifying original
+        df = df.copy()
         
         # Ensure DatetimeIndex
         if not isinstance(df.index, pd.DatetimeIndex):
-            df = df.set_index('timestamp')
+            if 'timestamp' in df.columns:
+                df = df.set_index('timestamp')
+            else:
+                df.index = pd.to_datetime(df.index)
         
         # ========== CORE INDICATORS ==========
         
-        # RSI (14)
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
+        # PERFORMANCE: RSI calculation optimized
+        # Use pandas_ta for better performance if available, otherwise manual
+        try:
+            # Try using pandas_ta for faster RSI calculation
+            import pandas_ta as ta
+            df['rsi'] = ta.rsi(df['close'], length=14)
+        except:
+            # Fallback to manual calculation
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=1).mean()
+            rs = gain / (loss + 1e-10)  # Add small epsilon to avoid division by zero
+            df['rsi'] = 100 - (100 / (1 + rs))
         
-        # MACD (12, 26, 9)
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = exp1 - exp2
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['macd_signal']
+        # PERFORMANCE: MACD calculation optimized
+        try:
+            import pandas_ta as ta
+            macd_data = ta.macd(df['close'], fast=12, slow=26, signal=9)
+            if macd_data is not None and isinstance(macd_data, pd.DataFrame) and not macd_data.empty:
+                # pandas_ta returns DataFrame with columns like MACD_12_26_9, MACDs_12_26_9, MACDh_12_26_9
+                cols = macd_data.columns
+                if len(cols) >= 1:
+                    df['macd'] = macd_data.iloc[:, 0]
+                if len(cols) >= 2:
+                    df['macd_signal'] = macd_data.iloc[:, 1]
+                if len(cols) >= 3:
+                    df['macd_hist'] = macd_data.iloc[:, 2]
+            else:
+                # Fallback
+                exp1 = df['close'].ewm(span=12, adjust=False).mean()
+                exp2 = df['close'].ewm(span=26, adjust=False).mean()
+                df['macd'] = exp1 - exp2
+                df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+                df['macd_hist'] = df['macd'] - df['macd_signal']
+        except Exception as e:
+            # Fallback to manual calculation
+            exp1 = df['close'].ewm(span=12, adjust=False).mean()
+            exp2 = df['close'].ewm(span=26, adjust=False).mean()
+            df['macd'] = exp1 - exp2
+            df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+            df['macd_hist'] = df['macd'] - df['macd_signal']
         
         # Bollinger Bands (20, 2)
         df['bb_mid'] = df['close'].rolling(window=20).mean()
@@ -428,14 +663,28 @@ class MarketDataProvider:
     async def get_market_snapshot(self, symbol: str) -> Dict[str, Any]:
         """
         Get comprehensive market snapshot with all indicators.
+        Optimized with caching and parallel timeframe fetching.
         """
+        # Check cache first
+        now = datetime.now()
+        if symbol in self._market_data_cache:
+            cache_time = self._market_data_cache_times.get(symbol)
+            if cache_time and (now - cache_time).total_seconds() < self._market_data_cache_ttl:
+                logger.debug(f"Using cached market snapshot for {symbol}")
+                return self._market_data_cache[symbol].copy()
+        
         timeframes = ['15m', '1h', '4h']
         
-        # Get BTC trend first (critical for alts)
-        btc_trend = await self.get_btc_trend() if symbol != "BTC/USDT" else None
+        # PERFORMANCE: Fetch BTC trend and Fear & Greed in parallel
+        btc_task = self.get_btc_trend() if symbol != "BTC/USDT" else None
+        fng_task = self.get_fear_greed_index()
         
-        # Get Fear & Greed
-        fear_greed = await self.get_fear_greed_index()
+        # Wait for both
+        if btc_task:
+            btc_trend, fear_greed = await asyncio.gather(btc_task, fng_task)
+        else:
+            fear_greed = await fng_task
+            btc_trend = None
         
         snapshot = {
             "symbol": symbol,
@@ -445,8 +694,19 @@ class MarketDataProvider:
             "timeframes": {}
         }
 
-        for tf in timeframes:
-            df = await self.get_ohlcv(symbol, timeframe=tf, limit=100)
+        # PERFORMANCE: Fetch all timeframes in parallel instead of sequentially
+        timeframe_tasks = {
+            tf: self.get_ohlcv(symbol, timeframe=tf, limit=100)
+            for tf in timeframes
+        }
+        
+        # Wait for all timeframes
+        timeframe_results = await asyncio.gather(*timeframe_tasks.values(), return_exceptions=True)
+        
+        for tf, df in zip(timeframes, timeframe_results):
+            if isinstance(df, Exception):
+                logger.error(f"Error fetching {tf} for {symbol}: {df}")
+                continue
             if df.empty:
                 continue
             
@@ -494,14 +754,14 @@ class MarketDataProvider:
                 trend_strength = "no_trend"
             
             snapshot["timeframes"][tf] = {
-                "price": round(latest['close'], 2),
+                "price": round(float(latest['close']), 2),
                 "change_pct": round(change_pct, 2),
                 "change_24h": round(change_24h, 2),
                 
                 # Trend
                 "trend": trend_signal,
                 "trend_strength": trend_strength,
-                "ema_alignment": "bullish" if latest['ema_9'] > latest['ema_21'] else "bearish",
+                "ema_alignment": "bullish" if float(latest['ema_9']) > float(latest['ema_21']) else "bearish",
                 
                 # Momentum
                 "momentum": momentum,
@@ -544,5 +804,15 @@ class MarketDataProvider:
             snapshot['btc_safe'] = btc_trend.get('is_safe_for_alts', True)
             if not snapshot['btc_safe']:
                 snapshot['warning'] = "⚠️ BTC is bearish - avoid buying alts"
+
+        # Cache the snapshot
+        self._market_data_cache[symbol] = snapshot.copy()
+        self._market_data_cache_times[symbol] = now
+        
+        # Clean old cache entries (keep last 50 symbols)
+        if len(self._market_data_cache) > 50:
+            oldest_symbol = min(self._market_data_cache_times.items(), key=lambda x: x[1])[0]
+            del self._market_data_cache[oldest_symbol]
+            del self._market_data_cache_times[oldest_symbol]
 
         return snapshot

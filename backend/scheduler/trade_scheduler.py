@@ -159,6 +159,16 @@ class TradingScheduler:
         )
         
         self.scheduler.start()
+        logger.info("Trading scheduler started")
+    
+    def stop(self):
+        """Stop the trading scheduler gracefully."""
+        try:
+            if hasattr(self, 'scheduler') and self.scheduler.running:
+                self.scheduler.shutdown(wait=False)
+                logger.info("Trading scheduler stopped")
+        except Exception as e:
+            logger.error(f"Error stopping scheduler: {e}")
         
         print(f"""
 ╔══════════════════════════════════════════════════════════════════╗
@@ -192,10 +202,16 @@ class TradingScheduler:
                 return False
             
             # Restore balances and positions to exchange
+            restored_positions = state.get('positions', {})
             self.paper_exchange.restore_state({
                 'balances': state.get('balances', {}),
-                'positions': state.get('positions', {})
+                'positions': restored_positions
             })
+            
+            # Position safety check: Verify positions are still valid
+            if restored_positions:
+                print(f"  🔍 Validating {len(restored_positions)} restored positions...")
+                await self._validate_restored_positions(restored_positions)
             
             # Restore daily stats
             daily_stats = state.get('daily_stats', {})
@@ -252,6 +268,56 @@ class TradingScheduler:
             logger.error(f"Failed to restore state: {e}")
             print(f"⚠️ Failed to restore state: {e}")
             return False
+    
+    async def _validate_restored_positions(self, restored_positions: Dict[str, Any]):
+        """
+        Validate restored positions by checking current market prices.
+        Ensures positions are still valid and prices haven't changed dramatically.
+        """
+        if not restored_positions:
+            return
+        
+        try:
+            invalid_positions = []
+            
+            for symbol, pos_data in restored_positions.items():
+                try:
+                    # Get current price from OHLCV
+                    ohlcv = await self.market_data_provider.get_ohlcv(symbol, "1h", 1)
+                    if ohlcv.empty:
+                        logger.warning(f"Could not fetch current price for {symbol}, skipping validation")
+                        continue
+                    
+                    current_price = float(ohlcv.iloc[-1]['close'])
+                    
+                    entry_price = pos_data.get('entry_price', 0)
+                    if entry_price == 0:
+                        invalid_positions.append(symbol)
+                        continue
+                    
+                    # Check if price has moved more than 50% (likely invalid)
+                    price_change_pct = abs((current_price - entry_price) / entry_price) * 100
+                    
+                    if price_change_pct > 50:
+                        logger.warning(
+                            f"Position {symbol} has suspicious price change: "
+                            f"Entry=${entry_price:.2f}, Current=${current_price:.2f} ({price_change_pct:.1f}%)"
+                        )
+                        # Don't mark as invalid, just warn - could be legitimate large move
+                    
+                except Exception as e:
+                    logger.error(f"Error validating position {symbol}: {e}")
+                    # Don't fail on validation errors, just log
+            
+            if invalid_positions:
+                logger.warning(f"Found {len(invalid_positions)} invalid positions: {invalid_positions}")
+                print(f"  ⚠️  Warning: {len(invalid_positions)} positions have invalid data")
+            else:
+                print(f"  ✅ All positions validated successfully")
+                
+        except Exception as e:
+            logger.error(f"Error during position validation: {e}")
+            print(f"  ⚠️  Position validation failed: {e}")
     
     async def save_state(self) -> bool:
         """Save current state to database."""
@@ -317,15 +383,23 @@ class TradingScheduler:
             # Only log every 4th check (every 2 minutes) to reduce noise
             verbose = self.stop_check_count % 4 == 0
             
-            # Get current prices for all symbols with positions
+            # PERFORMANCE: Get current prices for all symbols in parallel
             current_prices = {}
-            for symbol in positions.keys():
-                try:
-                    ohlcv = await self.market_data_provider.get_ohlcv(symbol, limit=1)
-                    if not ohlcv.empty:
-                        current_prices[symbol] = ohlcv.iloc[-1]['close']
-                except Exception as e:
-                    logger.warning(f"Failed to get price for {symbol}: {e}")
+            price_tasks = {
+                symbol: self.market_data_provider.get_ohlcv(symbol, limit=1)
+                for symbol in positions.keys()
+            }
+            
+            # Fetch all prices in parallel
+            price_results = await asyncio.gather(*price_tasks.values(), return_exceptions=True)
+            
+            # Process results
+            for symbol, result in zip(positions.keys(), price_results):
+                if isinstance(result, Exception):
+                    logger.warning(f"Failed to get price for {symbol}: {result}")
+                    continue
+                if not result.empty:
+                    current_prices[symbol] = float(result.iloc[-1]['close'])
             
             if not current_prices:
                 return
@@ -459,9 +533,12 @@ class TradingScheduler:
             print(f"  ANALYSIS CYCLE #{self.cycle_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"{'='*60}")
             
-            # Process symbols with controlled concurrency
-            # Process 3 at a time to avoid rate limits while being faster than sequential
-            batch_size = 3
+            # PERFORMANCE: Process symbols with controlled concurrency
+            # Batch size is configurable via settings
+            from backend.config import settings
+            batch_size = settings.parallel_analysis_batch_size
+            batch_delay = settings.parallel_analysis_batch_delay_seconds
+            
             for i in range(0, len(self.symbols), batch_size):
                 batch = self.symbols[i:i + batch_size]
                 tasks = [self._process_symbol_safe(symbol) for symbol in batch]
@@ -469,7 +546,7 @@ class TradingScheduler:
                 
                 # Small delay between batches to avoid rate limits
                 if i + batch_size < len(self.symbols):
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(batch_delay)
             
             # 4. Print Portfolio Summary
             await self._print_portfolio_summary()
@@ -507,12 +584,25 @@ class TradingScheduler:
             print(f"--- DAILY RESET: New Start Balance ${self.daily_start_balance:,.2f} ---")
 
     async def _calculate_portfolio_value(self) -> float:
-        """Calculate total portfolio value."""
+        """
+        Calculate total portfolio value.
+        PERFORMANCE: Fetches all prices in parallel.
+        """
         total_value = self.paper_exchange.get_balance("USDT")
         
-        for sym in self.symbols:
-            ohlcv = await self.market_data_provider.get_ohlcv(sym, limit=1)
-            price = ohlcv.iloc[-1]['close'] if not ohlcv.empty else 0
+        # PERFORMANCE: Fetch all prices in parallel
+        price_tasks = {
+            sym: self.market_data_provider.get_ohlcv(sym, limit=1)
+            for sym in self.symbols
+        }
+        
+        price_results = await asyncio.gather(*price_tasks.values(), return_exceptions=True)
+        
+        # Process results
+        for sym, result in zip(self.symbols, price_results):
+            if isinstance(result, Exception) or result.empty:
+                continue
+            price = float(result.iloc[-1]['close'])
             asset = sym.split('/')[0]
             qty = self.paper_exchange.get_balance(asset)
             total_value += qty * price
@@ -533,12 +623,23 @@ class TradingScheduler:
         
         print(f"\n📊 Checking {len(positions)} open position(s)...")
         
-        # Get current prices for all symbols with positions
+        # PERFORMANCE: Get current prices for all symbols in parallel
         current_prices = {}
-        for symbol in positions.keys():
-            ohlcv = await self.market_data_provider.get_ohlcv(symbol, limit=1)
-            if not ohlcv.empty:
-                current_prices[symbol] = ohlcv.iloc[-1]['close']
+        price_tasks = {
+            symbol: self.market_data_provider.get_ohlcv(symbol, limit=1)
+            for symbol in positions.keys()
+        }
+        
+        # Fetch all prices in parallel
+        price_results = await asyncio.gather(*price_tasks.values(), return_exceptions=True)
+        
+        # Process results
+        for symbol, result in zip(positions.keys(), price_results):
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to get price for {symbol}: {result}")
+                continue
+            if not result.empty:
+                current_prices[symbol] = float(result.iloc[-1]['close'])
         
         # Check stops
         closed = self.paper_exchange.check_stops(current_prices, self.atr_cache)
@@ -618,7 +719,7 @@ class TradingScheduler:
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}")
             print(f"  ❌ Error processing {symbol}: {str(e)[:50]}")
-    
+
     async def _process_symbol(self, symbol: str):
         """Process a single symbol for trading signals."""
         print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Processing {symbol}")

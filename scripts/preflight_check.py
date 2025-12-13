@@ -127,14 +127,38 @@ async def check_gemini():
 
 
 async def check_exchange():
-    """Test Binance data connection."""
+    """Test exchange data connection with fallback."""
     print(f"\n{Colors.BLUE}[3/6] Testing Exchange Connection{Colors.END}")
     
     try:
         from backend.data.market_data import MarketDataProvider
+        from backend.config import settings
         
-        provider = MarketDataProvider(exchange_id='binance')
-        check_pass("Provider initialized", "Binance")
+        # Build API credentials dict
+        api_credentials = {
+            'kraken': {
+                'api_key': settings.kraken_api_key if settings.kraken_api_key else None,
+                'api_secret': settings.kraken_api_secret if settings.kraken_api_secret else None,
+                'passphrase': None
+            },
+            'kucoin': {
+                'api_key': settings.kucoin_api_key if settings.kucoin_api_key else None,
+                'api_secret': settings.kucoin_api_secret if settings.kucoin_api_secret else None,
+                'passphrase': settings.kucoin_passphrase if settings.kucoin_passphrase else None
+            }
+        }
+        
+        print(f"  → Trying primary: {settings.exchange_id}")
+        if settings.exchange_fallbacks:
+            print(f"  → Fallbacks: {', '.join(settings.exchange_fallbacks)}")
+        
+        provider = await MarketDataProvider.create_with_fallback(
+            primary_exchange=settings.exchange_id,
+            fallback_exchanges=settings.exchange_fallbacks,
+            api_credentials=api_credentials
+        )
+        
+        check_pass("Provider initialized", provider.exchange_id.capitalize())
         
         # Fetch BTC price
         ohlcv = await provider.get_ohlcv("BTC/USDT", limit=1)
@@ -216,18 +240,40 @@ async def check_config():
         
         # Check critical values
         issues = []
+        critical_issues = []
         
+        # Critical validations (will fail if too dangerous)
+        if settings.max_drawdown_pct > 0.30:
+            critical_issues.append(f"Max drawdown {settings.max_drawdown_pct*100}% > 30% is DANGEROUS!")
+        
+        if settings.max_position_size_pct > 0.50:
+            critical_issues.append(f"Position size {settings.max_position_size_pct*100}% > 50% is TOO RISKY!")
+        
+        if settings.max_daily_loss_pct > 0.10:
+            critical_issues.append(f"Max daily loss {settings.max_daily_loss_pct*100}% > 10% is dangerous")
+        
+        # Warning validations
         if settings.max_drawdown_pct > 0.25:
-            issues.append(f"Max drawdown {settings.max_drawdown_pct*100}% is very high")
+            issues.append(f"Max drawdown {settings.max_drawdown_pct*100}% is very high (recommended: <25%)")
         
         if settings.max_position_size_pct > 0.20:
-            issues.append(f"Position size {settings.max_position_size_pct*100}% is risky")
+            issues.append(f"Position size {settings.max_position_size_pct*100}% is risky (recommended: <20%)")
         
         if len(settings.trading_symbols) > 15:
             issues.append(f"Trading {len(settings.trading_symbols)} symbols may hit rate limits")
         
         if settings.initial_balance < 1000:
-            issues.append(f"Initial balance ${settings.initial_balance} is low for testing")
+            issues.append(f"Initial balance ${settings.initial_balance} is low for meaningful testing")
+        
+        if settings.analysis_interval_minutes < 5:
+            issues.append(f"Analysis interval {settings.analysis_interval_minutes}min is very frequent (may hit API limits)")
+        
+        if settings.stop_check_seconds < 10:
+            issues.append(f"Stop check {settings.stop_check_seconds}s is very frequent (may hit API limits)")
+        
+        # Validate risk/reward ratio
+        if settings.default_risk_reward < 1.5:
+            issues.append(f"Risk/reward ratio {settings.default_risk_reward}:1 is low (recommended: >=2:1)")
         
         check_pass("Settings loaded")
         check_pass(f"Trading mode: {settings.trading_mode.value}")
@@ -236,8 +282,16 @@ async def check_config():
         check_pass(f"Max position: {settings.max_position_size_pct*100}%")
         check_pass(f"Max drawdown: {settings.max_drawdown_pct*100}%")
         
+        # Show warnings
         for issue in issues:
             check_warn("Config", issue)
+        
+        # Show critical issues (but don't fail - let user decide)
+        for issue in critical_issues:
+            print(f"  {Colors.RED}⚠{Colors.END} {Colors.RED}{Colors.BOLD}CRITICAL:{Colors.END} {issue}")
+        
+        if critical_issues:
+            print(f"\n  {Colors.YELLOW}⚠️  Review critical issues above before proceeding!{Colors.END}")
         
         return True
         

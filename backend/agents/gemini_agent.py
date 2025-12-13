@@ -2,9 +2,10 @@ import os
 import json
 import logging
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ _gemini_rate_limiter = GeminiRateLimiter(calls_per_minute=30)
 
 class GeminiAgent:
     """
-    Trading agent using Google Gemini API.
+    Trading agent using Google Gemini API with fallback key rotation.
     """
     
     def __init__(self, config: Dict[str, Any] = None):
@@ -46,15 +47,77 @@ class GeminiAgent:
         # Use the stable 2.0 Flash model
         self.model_name = config.get("model", "models/gemini-2.0-flash") if config else "models/gemini-2.0-flash"
         
-        # Configure Gemini
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY not found in environment variables")
+        # Load API keys from settings
+        from backend.config import settings
         
-        genai.configure(api_key=api_key)
+        # Primary API key
+        primary_key = settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+        if not primary_key:
+            raise ValueError("GEMINI_API_KEY not found in environment variables or settings")
+        
+        # Fallback keys (comma-separated string)
+        fallback_keys_str = settings.gemini_fallback_keys or os.getenv("GEMINI_FALLBACK_KEYS", "")
+        fallback_keys = [k.strip() for k in fallback_keys_str.split(",") if k.strip()] if fallback_keys_str else []
+        
+        # Combine all keys: primary first, then fallbacks
+        self.api_keys: List[str] = [primary_key] + fallback_keys
+        self.current_key_index = 0
+        self.failed_keys: set = set()  # Track keys that have failed
+        
+        # Initialize with primary key
+        self._configure_api_key(self.api_keys[0])
         self.model = genai.GenerativeModel(self.model_name)
         
         logger.info(f"Gemini Agent initialized with model: {self.model_name}")
+        logger.info(f"Total API keys available: {len(self.api_keys)} (primary + {len(fallback_keys)} fallback)")
+    
+    def _configure_api_key(self, api_key: str):
+        """Configure Gemini with a specific API key."""
+        genai.configure(api_key=api_key)
+        logger.debug(f"Configured Gemini with API key: {api_key[:10]}...{api_key[-4:]}")
+    
+    def _rotate_to_next_key(self) -> bool:
+        """
+        Rotate to the next available API key.
+        Returns True if a new key was found, False if all keys are exhausted.
+        """
+        # Try next keys in order
+        for i in range(len(self.api_keys)):
+            next_index = (self.current_key_index + 1) % len(self.api_keys)
+            next_key = self.api_keys[next_index]
+            
+            # Skip keys that have already failed
+            if next_key in self.failed_keys:
+                self.current_key_index = next_index
+                continue
+            
+            # Found a valid key
+            self.current_key_index = next_index
+            self._configure_api_key(next_key)
+            self.model = genai.GenerativeModel(self.model_name)
+            
+            logger.warning(f"Rotated to fallback API key #{next_index + 1}/{len(self.api_keys)}")
+            return True
+        
+        # All keys exhausted
+        logger.error("All Gemini API keys have been exhausted!")
+        return False
+    
+    def _is_quota_error(self, error: Exception) -> bool:
+        """Check if error is a quota/rate limit error."""
+        error_str = str(error).lower()
+        quota_indicators = [
+            "quota",
+            "rate limit",
+            "resource exhausted",
+            "429",
+            "503",
+            "usage limit",
+            "billing",
+            "permission denied",
+            "api key not valid"
+        ]
+        return any(indicator in error_str for indicator in quota_indicators)
     
     async def analyze_market(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -163,65 +226,101 @@ class GeminiAgent:
         Should we BUY, SELL, or HOLD? Respond in JSON format.
         """
         
-        try:
-            # Apply rate limiting
-            await _gemini_rate_limiter.wait_if_needed()
-            
-            # Configure safety settings to avoid blocking legitimate trading analysis
-            safety_settings = [
-                {
-                    "category": "HARM_CATEGORY_HARASSMENT",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_HATE_SPEECH",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                    "threshold": "BLOCK_NONE"
-                },
-            ]
-
-            # Gemini API call
-            response = self.model.generate_content(
-                f"{system_prompt}\n\n{user_prompt}",
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.7,
-                    max_output_tokens=2000, # Increased to avoid truncation
-                ),
-                safety_settings=safety_settings
-            )
-            
-            # Parse response
+        # Retry with key rotation on quota errors
+        max_retries = len(self.api_keys)
+        last_error = None
+        
+        for attempt in range(max_retries):
             try:
-                response_text = response.text.strip()
-            except Exception:
-                # Fallback if response.text fails (e.g. finish_reason is not STOP)
-                if response.candidates and response.candidates[0].content.parts:
-                    response_text = response.candidates[0].content.parts[0].text.strip()
+                # Apply rate limiting
+                await _gemini_rate_limiter.wait_if_needed()
+                
+                # Configure safety settings to avoid blocking legitimate trading analysis
+                safety_settings = [
+                    {
+                        "category": "HARM_CATEGORY_HARASSMENT",
+                        "threshold": "BLOCK_NONE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_HATE_SPEECH",
+                        "threshold": "BLOCK_NONE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        "threshold": "BLOCK_NONE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                        "threshold": "BLOCK_NONE"
+                    },
+                ]
+
+                # Get token limit from settings
+                from backend.config import settings
+                max_tokens = settings.llm_max_output_tokens
+                
+                # Gemini API call
+                response = self.model.generate_content(
+                    f"{system_prompt}\n\n{user_prompt}",
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.7,
+                        max_output_tokens=max_tokens,
+                    ),
+                    safety_settings=safety_settings
+                )
+                
+                # Parse response
+                try:
+                    response_text = response.text.strip()
+                except Exception:
+                    # Fallback if response.text fails (e.g. finish_reason is not STOP)
+                    if response.candidates and response.candidates[0].content.parts:
+                        response_text = response.candidates[0].content.parts[0].text.strip()
+                    else:
+                        raise ValueError(f"Empty response from Gemini. Finish reason: {response.candidates[0].finish_reason if response.candidates else 'Unknown'}")
+                
+                # Remove markdown code blocks if present
+                if response_text.startswith("```json"):
+                    response_text = response_text.replace("```json", "").replace("```", "").strip()
+                elif response_text.startswith("```"):
+                    response_text = response_text.replace("```", "").strip()
+                
+                # Parse JSON
+                decision = json.loads(response_text)
+                return decision
+                
+            except Exception as e:
+                last_error = e
+                error_msg = str(e)
+                logger.warning(f"Gemini API call failed (attempt {attempt + 1}/{max_retries}): {error_msg[:100]}")
+                
+                # Check if it's a quota/rate limit error
+                if self._is_quota_error(e):
+                    # Mark current key as failed
+                    current_key = self.api_keys[self.current_key_index]
+                    self.failed_keys.add(current_key)
+                    logger.warning(f"API key #{self.current_key_index + 1} hit quota limit. Rotating...")
+                    
+                    # Try next key
+                    if self._rotate_to_next_key():
+                        # Wait a bit before retrying with new key
+                        await asyncio.sleep(1.0)
+                        continue
+                    else:
+                        # All keys exhausted
+                        logger.error("All Gemini API keys exhausted. Cannot proceed.")
+                        break
                 else:
-                    raise ValueError(f"Empty response from Gemini. Finish reason: {response.candidates[0].finish_reason if response.candidates else 'Unknown'}")
-            
-            # Remove markdown code blocks if present
-            if response_text.startswith("```json"):
-                response_text = response_text.replace("```json", "").replace("```", "").strip()
-            elif response_text.startswith("```"):
-                response_text = response_text.replace("```", "").strip()
-            
-            # Parse JSON
-            decision = json.loads(response_text)
-            return decision
-            
-        except Exception as e:
-            logger.error(f"Error in Gemini analysis: {e}")
-            # Return safe default
-            return {
-                "trend": "neutral",
-                "confidence": "low",
-                "reasoning": f"Error in analysis: {str(e)}"
-            }
+                    # Not a quota error, don't retry with different key
+                    logger.error(f"Non-quota error in Gemini analysis: {e}")
+                    break
+        
+        # All retries failed
+        logger.error(f"Error in Gemini analysis after {max_retries} attempts: {last_error}")
+        # Return safe default
+        return {
+            "trend": "neutral",
+            "confidence": "low",
+            "signal_type": "HOLD",
+            "reasoning": f"Error in analysis: {str(last_error)[:100] if last_error else 'Unknown error'}"
+        }

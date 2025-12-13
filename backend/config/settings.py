@@ -23,6 +23,15 @@ class RiskProfile(str, Enum):
     AGGRESSIVE = "aggressive"
 
 
+class AgentType(str, Enum):
+    GEMINI = "gemini"
+    OPENROUTER = "openrouter"
+    OPENAI = "openai"
+    CLAUDE = "claude"
+    DEEPSEEK = "deepseek"
+    QWEN = "qwen"
+
+
 class Settings(BaseSettings):
     """
     Application settings loaded from environment variables.
@@ -35,7 +44,7 @@ class Settings(BaseSettings):
     # =========================
     # API KEYS
     # =========================
-    gemini_api_key: str = Field(default="", env="GEMINI_API_KEY")
+    # Note: gemini_api_key is defined below in AGENT SELECTION section with fallback support
     openai_api_key: str = Field(default="", env="OPENAI_API_KEY")
     openrouter_api_key: str = Field(default="", env="OPENROUTER_API_KEY")
     anthropic_api_key: str = Field(default="", env="ANTHROPIC_API_KEY")
@@ -57,20 +66,99 @@ class Settings(BaseSettings):
     risk_profile: RiskProfile = Field(default=RiskProfile.CONSERVATIVE)
     
     # =========================
+    # AGENT SELECTION
+    # =========================
+    # Primary agent: Gemini (falls back to rule-based on failure)
+    agent_type: AgentType = Field(default=AgentType.GEMINI, env="AGENT_TYPE")
+    openrouter_model: str = Field(default="google/gemini-2.0-flash-001", env="OPENROUTER_MODEL")
+    
+    # Gemini API Keys (with fallback support)
+    gemini_api_key: str = Field(default="", env="GEMINI_API_KEY")
+    gemini_fallback_keys: str = Field(
+        default="",
+        env="GEMINI_FALLBACK_KEYS"  # Comma-separated list of fallback API keys
+    )
+    # Example: GEMINI_FALLBACK_KEYS=key1,key2,key3
+    
+    # LLM Token Configuration
+    llm_max_output_tokens: int = Field(default=4000, ge=500, le=32000, env="LLM_MAX_OUTPUT_TOKENS")
+    # Increased from 2000 to 4000 for more detailed analysis
+    # Can be set up to 32000 for models that support it
+    
+    # =========================
+    # EXCHANGE SELECTION
+    # =========================
+    # Options: binance, binanceus, kraken, kucoin, bybit, okx, coinbase
+    exchange_id: str = Field(default="binance", env="EXCHANGE_ID")
+    
+    # Fallback exchanges (tried in order if primary fails)
+    exchange_fallbacks: List[str] = Field(
+        default=["kraken", "kucoin", "bybit", "okx"],
+        env="EXCHANGE_FALLBACKS"
+    )
+    
+    # Exchange API credentials (optional - not needed for public data)
+    kraken_api_key: str = Field(default="", env="KRAKEN_API_KEY")
+    kraken_api_secret: str = Field(default="", env="KRAKEN_API_SECRET")
+    kucoin_api_key: str = Field(default="", env="KUCOIN_API_KEY")
+    kucoin_api_secret: str = Field(default="", env="KUCOIN_API_SECRET")
+    kucoin_passphrase: str = Field(default="", env="KUCOIN_API_PASSPHRASE")  # KuCoin requires passphrase
+    
+    # =========================
+    # DATABASE CONFIGURATION
+    # =========================
+    # PostgreSQL is the default (recommended for production)
+    # Format: postgresql+asyncpg://user:password@host:port/database
+    # Example: postgresql+asyncpg://alpha_user:alpha_password@localhost:5432/alpha_arena
+    # 
+    # For SQLite (fallback, no setup required):
+    # sqlite+aiosqlite:///./alpha_arena.db
+    database_url: str = Field(
+        default="postgresql+asyncpg://alpha_user:alpha_password@localhost:5432/alpha_arena",
+        env="DATABASE_URL"
+    )
+    
+    # =========================
     # SYMBOLS & SCHEDULING
     # =========================
-    # Start with fewer symbols to avoid rate limits
-    # Expand after testing is stable
+    # Trading symbols - Top cryptocurrencies with good liquidity
+    # Can be overridden via TRADING_SYMBOLS env var (comma-separated)
     trading_symbols: List[str] = Field(
         default=[
-            "BTC/USDT", "ETH/USDT", "SOL/USDT",
-            "BNB/USDT"  # Start with 4, add more after validation
-        ]
+            # Top 4 (Major)
+            "BTC/USDT",   # Bitcoin
+            "ETH/USDT",   # Ethereum
+            "SOL/USDT",   # Solana
+            "BNB/USDT",   # Binance Coin
+            
+            # Top Altcoins (High liquidity)
+            "XRP/USDT",   # Ripple
+            "ADA/USDT",   # Cardano
+            "DOGE/USDT",  # Dogecoin
+            "AVAX/USDT",  # Avalanche
+            "MATIC/USDT", # Polygon
+            "DOT/USDT",   # Polkadot
+            "LINK/USDT",  # Chainlink
+            "UNI/USDT",   # Uniswap
+            "LTC/USDT",   # Litecoin
+            "ATOM/USDT",  # Cosmos
+        ],
+        env="TRADING_SYMBOLS"  # Can override via env: TRADING_SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT
     )
     
     analysis_interval_minutes: int = Field(default=15, ge=1, le=60)
     stop_check_seconds: int = Field(default=30, ge=5, le=300)
     state_save_minutes: int = Field(default=5, ge=1, le=30)
+    
+    # Performance settings
+    parallel_analysis_batch_size: int = Field(default=3, ge=1, le=10, env="PARALLEL_BATCH_SIZE")
+    # Number of symbols to process in parallel (higher = faster but more API calls)
+    
+    parallel_analysis_batch_delay_seconds: float = Field(default=1.0, ge=0.1, le=5.0, env="BATCH_DELAY_SECONDS")
+    # Delay between batches to avoid rate limits
+    
+    market_data_cache_ttl_seconds: int = Field(default=60, ge=10, le=300, env="MARKET_DATA_CACHE_TTL")
+    # Cache market snapshots for this many seconds (reduces API calls)
     
     # =========================
     # RISK MANAGEMENT

@@ -136,7 +136,7 @@ class CorrelationManager:
             return False, (
                 f"Sector {new_category} exposure would be {sector_exposure*100:.1f}% "
                 f"(limit: {self.max_sector_exposure_pct*100:.1f}%)"
-            )
+                )
         
         # Rule 4: Correlation check with existing positions
         if current_positions and self._correlation_matrix is not None:
@@ -196,7 +196,7 @@ class CorrelationManager:
         
         for pos_symbol in current_positions.keys():
             corr = self._get_correlation(symbol, pos_symbol)
-            
+        
             # Weight BTC correlation higher
             if pos_symbol == "BTC/USDT":
                 corr = corr * (1 + self.btc_correlation_weight)
@@ -237,20 +237,30 @@ class CorrelationManager:
         logger.info(f"Updating correlation matrix for {len(symbols)} symbols...")
         
         try:
-            # Fetch price history for all symbols
+            # PERFORMANCE: Fetch price history for all symbols in parallel
             price_data = {}
             
-            for symbol in symbols:
-                try:
-                    ohlcv = await market_data_provider.get_ohlcv(
-                        symbol, 
-                        timeframe='1h',
-                        limit=self.correlation_lookback_days * 24
-                    )
-                    if not ohlcv.empty:
-                        price_data[symbol] = ohlcv['close']
-                except Exception as e:
-                    logger.warning(f"Failed to get data for {symbol}: {e}")
+            # Create tasks for all symbols
+            fetch_tasks = {
+                symbol: market_data_provider.get_ohlcv(
+                    symbol, 
+                    timeframe='1h',
+                    limit=self.correlation_lookback_days * 24
+                )
+                for symbol in symbols
+            }
+            
+            # Fetch all in parallel
+            import asyncio
+            results = await asyncio.gather(*fetch_tasks.values(), return_exceptions=True)
+            
+            # Process results
+            for symbol, result in zip(symbols, results):
+                if isinstance(result, Exception):
+                    logger.warning(f"Failed to get data for {symbol}: {result}")
+                    continue
+                if not result.empty:
+                    price_data[symbol] = result['close']
             
             if len(price_data) < 2:
                 logger.warning("Not enough data for correlation calculation")
